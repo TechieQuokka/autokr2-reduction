@@ -39,12 +39,15 @@ class Denoiser:
             self.init_df = init_df
             self.resample = resample
 
-            # Initialize DeepFilterNet
+            # Initialize DeepFilterNet (device is handled internally)
             self.model, self.df_state, _ = init_df(
                 model_base_dir=model_path,
-                post_filter=True,
-                device=self.device
+                post_filter=True
             )
+
+            # Move model to selected device
+            if hasattr(self.model, 'to'):
+                self.model = self.model.to(self.device)
 
             print(f"✓ DeepFilterNet3 loaded on {self.device}")
 
@@ -69,16 +72,18 @@ class Denoiser:
         self,
         audio: np.ndarray,
         sample_rate: int,
-        strength: float = 0.7
+        strength: float = 0.7,
+        chunk_size_sec: float = 10.0
     ) -> np.ndarray:
         """
-        Apply DeepFilterNet3 noise reduction.
+        Apply DeepFilterNet3 noise reduction with chunk processing for memory efficiency.
 
         Args:
             audio: Input audio (numpy array, mono)
             sample_rate: Sample rate of the audio
             strength: Noise reduction strength (0.0 to 1.0)
                      Higher values = more aggressive noise reduction
+            chunk_size_sec: Size of each processing chunk in seconds (default: 10.0)
 
         Returns:
             Denoised audio (numpy array)
@@ -89,20 +94,56 @@ class Denoiser:
         if not (0.0 <= strength <= 1.0):
             raise ValueError(f"Strength must be between 0.0 and 1.0, got {strength}")
 
-        # Convert to torch tensor
-        audio_tensor = torch.from_numpy(audio).unsqueeze(0)  # Add batch dimension
+        # Calculate chunk size in samples
+        chunk_size = int(chunk_size_sec * sample_rate)
+        total_samples = len(audio)
 
-        # Apply DeepFilterNet enhancement
-        with torch.no_grad():
-            enhanced = self.enhance(
-                self.model,
-                self.df_state,
-                audio_tensor,
-                atten_lim_db=strength * 60  # Scale strength to attenuation limit
-            )
+        # Process short audio in one go
+        if total_samples <= chunk_size:
+            audio_tensor = torch.from_numpy(audio).float().unsqueeze(0)
+            with torch.no_grad():
+                # Conservative mode for already-clean audio
+                # Reduce aggressiveness to preserve voice quality
+                atten_lim = strength * 40  # Changed from 60 to 40 (less aggressive)
+                enhanced = self.enhance(
+                    self.model,
+                    self.df_state,
+                    audio_tensor,
+                    atten_lim_db=atten_lim
+                )
+            return enhanced.squeeze().cpu().numpy()
 
-        # Convert back to numpy
-        denoised = enhanced.squeeze().cpu().numpy()
+        # Process long audio in chunks
+        denoised = np.zeros_like(audio)
+        num_chunks = (total_samples + chunk_size - 1) // chunk_size
+
+        print(f"  Processing {num_chunks} chunks ({chunk_size_sec}s each)...")
+
+        for i in range(num_chunks):
+            start = i * chunk_size
+            end = min(start + chunk_size, total_samples)
+            chunk = audio[start:end]
+
+            # Progress indicator
+            progress = (i + 1) / num_chunks * 100
+            print(f"  → Chunk {i+1}/{num_chunks} ({progress:.1f}%)", end='\r', flush=True)
+
+            # Process chunk
+            chunk_tensor = torch.from_numpy(chunk).float().unsqueeze(0)
+            with torch.no_grad():
+                # Conservative mode for already-clean audio
+                atten_lim = strength * 40  # Changed from 60 to 40 (less aggressive)
+                enhanced_chunk = self.enhance(
+                    self.model,
+                    self.df_state,
+                    chunk_tensor,
+                    atten_lim_db=atten_lim
+                )
+
+            # Store result
+            denoised[start:end] = enhanced_chunk.squeeze().cpu().numpy()
+
+        print()  # New line after progress
 
         return denoised
 
@@ -115,7 +156,7 @@ class Denoiser:
         sample_rate: int = 48000
     ) -> np.ndarray:
         """
-        Apply amplitude-based noise gate to suppress low-level noise.
+        Apply RMS-based noise gate with proper envelope following.
 
         Args:
             audio: Input audio (numpy array)
@@ -127,38 +168,77 @@ class Denoiser:
         Returns:
             Gated audio (numpy array)
         """
-        # Convert dB threshold to linear amplitude
+        # Convert to torch tensor and move to GPU
+        audio_tensor = torch.from_numpy(audio).float().to(self.device)
+
+        # Convert dB threshold to linear RMS amplitude
         threshold_linear = 10 ** (threshold_db / 20)
 
-        # Calculate attack and release coefficients
-        attack_samples = int(attack_ms * sample_rate / 1000)
-        release_samples = int(release_ms * sample_rate / 1000)
+        # Calculate RMS envelope with proper window size (20ms for speech)
+        rms_window_ms = 20.0
+        rms_window_size = int(rms_window_ms * sample_rate / 1000)
+        if rms_window_size % 2 == 0:
+            rms_window_size += 1
 
-        # Compute envelope (absolute value with smoothing)
-        envelope = np.abs(audio)
+        # Compute RMS envelope using efficient convolution
+        audio_squared = audio_tensor ** 2
+        rms_kernel = torch.ones(1, 1, rms_window_size, device=self.device) / rms_window_size
 
-        # Apply gate
-        gain = np.ones_like(audio)
-        for i in range(len(audio)):
-            if envelope[i] < threshold_linear:
-                # Below threshold: reduce gain
-                if i > 0:
-                    # Smooth release
-                    gain[i] = max(0.0, gain[i-1] - (1.0 / release_samples))
-                else:
-                    gain[i] = 0.0
-            else:
-                # Above threshold: increase gain
-                if i > 0:
-                    # Smooth attack
-                    gain[i] = min(1.0, gain[i-1] + (1.0 / attack_samples))
-                else:
-                    gain[i] = 1.0
+        # Pad for RMS calculation
+        pad_size = rms_window_size // 2
+        audio_sq_padded = torch.nn.functional.pad(
+            audio_squared.unsqueeze(0).unsqueeze(0),
+            (pad_size, pad_size),
+            mode='replicate'
+        )
+
+        # Calculate RMS
+        rms_squared = torch.nn.functional.conv1d(audio_sq_padded, rms_kernel, padding=0)
+        rms = torch.sqrt(torch.clamp(rms_squared, min=1e-10)).squeeze()[:len(audio_tensor)]
+
+        # Create gate signal based on RMS
+        gate_open = (rms > threshold_linear).float()
+
+        # Apply hysteresis to prevent gate fluttering
+        # Once gate opens, it stays open longer (prevents choppy audio)
+        hold_samples = int(50 * sample_rate / 1000)  # 50ms hold time
+        if hold_samples > 1:
+            hold_kernel = torch.ones(1, 1, hold_samples, device=self.device)
+            gate_padded = torch.nn.functional.pad(
+                gate_open.unsqueeze(0).unsqueeze(0),
+                (hold_samples // 2, hold_samples // 2),
+                mode='replicate'
+            )
+            gate_held = torch.nn.functional.conv1d(gate_padded, hold_kernel, padding=0)
+            gate_open = (gate_held.squeeze()[:len(audio_tensor)] > 0).float()
+
+        # Apply exponential smoothing for attack/release
+        # This creates smooth transitions without loops
+        attack_coef = 1.0 - torch.exp(torch.tensor(-2.2 / (attack_ms * sample_rate / 1000), device=self.device))
+        release_coef = 1.0 - torch.exp(torch.tensor(-2.2 / (release_ms * sample_rate / 1000), device=self.device))
+
+        # Use a simple IIR-like smoothing (vectorized approximation)
+        # Create smoothed gain using cascaded moving averages (approximates exponential)
+        smooth_window = max(3, int(release_ms * sample_rate / 1000))
+        if smooth_window % 2 == 0:
+            smooth_window += 1
+
+        gain = gate_open
+        # Apply smoothing passes (cascading approximates exponential)
+        for _ in range(2):
+            smooth_kernel = torch.ones(1, 1, smooth_window, device=self.device) / smooth_window
+            gain_padded = torch.nn.functional.pad(
+                gain.unsqueeze(0).unsqueeze(0),
+                (smooth_window // 2, smooth_window // 2),
+                mode='replicate'
+            )
+            gain = torch.nn.functional.conv1d(gain_padded, smooth_kernel, padding=0).squeeze()[:len(audio_tensor)]
 
         # Apply gain to audio
-        gated = audio * gain
+        gated = audio_tensor * gain
 
-        return gated
+        # Convert back to numpy
+        return gated.cpu().numpy()
 
     def process(
         self,
